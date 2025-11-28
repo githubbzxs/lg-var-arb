@@ -114,7 +114,7 @@ LIGHTER_API_KEY_INDEX=your_api_key_index
 ### Basic Usage
 
 ```bash
-python arbitrage.py --ticker BTC --size 0.002
+python arbitrage.py --ticker BTC --size 0.002 --max-position 0.1 --long-threshold 10 --short-threshold 10
 ```
 
 ### Command Line Arguments

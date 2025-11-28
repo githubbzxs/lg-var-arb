@@ -552,10 +552,10 @@ class EdgexArb:
                 break
 
             # Execute trades
-            if (self.position_tracker.get_current_edgex_position() <= self.max_position and
+            if (self.position_tracker.get_current_edgex_position() < self.max_position and
                     long_ex):
                 await self._execute_long_trade()
-            elif (self.position_tracker.get_current_edgex_position() >= -1 * self.max_position and
+            elif (self.position_tracker.get_current_edgex_position() > -1 * self.max_position and
                   short_ex):
                 await self._execute_short_trade()
             else:
