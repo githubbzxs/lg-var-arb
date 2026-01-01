@@ -1,61 +1,53 @@
-"""Order placement and monitoring for EdgeX and Lighter exchanges."""
+"""Order placement and monitoring for Variational and Lighter exchanges."""
 import asyncio
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Tuple
 
-from edgex_sdk import Client, OrderSide, CancelOrderParams, GetOrderBookDepthParams
 from lighter.signer_client import SignerClient
+from variational import Client as VariationalClient
+from variational.models import TradeSide
 
 
 class OrderManager:
     """Manages order placement and monitoring for both exchanges."""
 
     def __init__(self, order_book_manager, logger: logging.Logger):
-        """Initialize order manager."""
         self.order_book_manager = order_book_manager
         self.logger = logger
 
-        # EdgeX client and config
-        self.edgex_client: Optional[Client] = None
-        self.edgex_contract_id: Optional[str] = None
-        self.edgex_tick_size: Optional[Decimal] = None
-        self.edgex_order_status: Optional[str] = None
-        self.edgex_client_order_id: str = ''
+        self.variational_client: Optional[VariationalClient] = None
+        self.variational_instrument: Optional[dict] = None
+        self.variational_target_companies: list[str] = []
+        self.variational_rfq_expires_seconds: int = 5
 
-        # Lighter client and config
         self.lighter_client: Optional[SignerClient] = None
         self.lighter_market_index: Optional[int] = None
         self.base_amount_multiplier: Optional[int] = None
         self.price_multiplier: Optional[int] = None
         self.tick_size: Optional[Decimal] = None
 
-        # Lighter order state
         self.lighter_order_filled = False
         self.lighter_order_price: Optional[Decimal] = None
         self.lighter_order_side: Optional[str] = None
         self.lighter_order_size: Optional[Decimal] = None
 
-        # Order execution tracking
         self.order_execution_complete = False
         self.waiting_for_lighter_fill = False
-        self.current_lighter_side: Optional[str] = None
-        self.current_lighter_quantity: Optional[Decimal] = None
-        self.current_lighter_price: Optional[Decimal] = None
 
-        # Callbacks
         self.on_order_filled: Optional[callable] = None
 
-    def set_edgex_config(self, client: Client, contract_id: str, tick_size: Decimal):
-        """Set EdgeX client and configuration."""
-        self.edgex_client = client
-        self.edgex_contract_id = contract_id
-        self.edgex_tick_size = tick_size
+    def set_variational_config(self, client: VariationalClient, instrument: dict,
+                               target_companies: list[str], rfq_expires_seconds: int = 5):
+        self.variational_client = client
+        self.variational_instrument = instrument
+        self.variational_target_companies = target_companies
+        self.variational_rfq_expires_seconds = rfq_expires_seconds
 
     def set_lighter_config(self, client: SignerClient, market_index: int,
                            base_amount_multiplier: int, price_multiplier: int, tick_size: Decimal):
-        """Set Lighter client and configuration."""
         self.lighter_client = client
         self.lighter_market_index = market_index
         self.base_amount_multiplier = base_amount_multiplier
@@ -63,127 +55,100 @@ class OrderManager:
         self.tick_size = tick_size
 
     def set_callbacks(self, on_order_filled: callable = None):
-        """Set callback functions."""
         self.on_order_filled = on_order_filled
 
-    def round_to_tick(self, price: Decimal) -> Decimal:
-        """Round price to tick size."""
-        if self.edgex_tick_size is None:
-            return price
-        return (price / self.edgex_tick_size).quantize(Decimal('1')) * self.edgex_tick_size
+    async def _run_variational(self, func, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
-    async def fetch_edgex_bbo_prices(self) -> tuple[Decimal, Decimal]:
-        """Fetch best bid/ask prices from EdgeX using websocket data."""
-        # Use WebSocket data if available
-        edgex_bid, edgex_ask = self.order_book_manager.get_edgex_bbo()
-        if (self.order_book_manager.edgex_order_book_ready and
-                edgex_bid and edgex_ask and edgex_bid > 0 and edgex_ask > 0 and edgex_bid < edgex_ask):
-            return edgex_bid, edgex_ask
+    def _rfq_expiry(self) -> str:
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=self.variational_rfq_expires_seconds)
+        return expires_at.isoformat().replace("+00:00", "Z")
 
-        # Fallback to REST API if websocket data is not available
-        self.logger.warning("WebSocket BBO data not available, falling back to REST API")
-        if not self.edgex_client:
-            raise Exception("EdgeX client not initialized")
+    async def fetch_variational_mid_price(self) -> Decimal:
+        if not self.variational_client or not self.variational_instrument:
+            raise Exception("Variational client not initialized")
 
-        depth_params = GetOrderBookDepthParams(contract_id=self.edgex_contract_id, limit=15)
-        order_book = await self.edgex_client.quote.get_order_book_depth(depth_params)
-        order_book_data = order_book['data']
+        resp = await self._run_variational(
+            self.variational_client.price_instrument,
+            self.variational_instrument,
+        )
+        return Decimal(resp.result["price"])
 
-        order_book_entry = order_book_data[0]
-        bids = order_book_entry.get('bids', [])
-        asks = order_book_entry.get('asks', [])
+    async def request_variational_quote(self, side: TradeSide, quantity: Decimal
+                                        ) -> Optional[Tuple[Decimal, str, str]]:
+        if not self.variational_client or not self.variational_instrument:
+            raise Exception("Variational client not initialized")
+        if not self.variational_target_companies:
+            raise Exception("Variational target companies not configured")
 
-        best_bid = Decimal(bids[0]['price']) if bids and len(bids) > 0 else Decimal('0')
-        best_ask = Decimal(asks[0]['price']) if asks and len(asks) > 0 else Decimal('0')
+        structure = {
+            "legs": [{
+                "side": side,
+                "ratio": 1,
+                "instrument": self.variational_instrument,
+            }]
+        }
 
-        return best_bid, best_ask
+        resp = await self._run_variational(
+            self.variational_client.create_rfq,
+            structure=structure,
+            qty=str(quantity),
+            expires_at=self._rfq_expiry(),
+            target_companies=self.variational_target_companies,
+        )
+        rfq_id = resp.result.get("rfq_id")
+        if not rfq_id:
+            self.logger.error("Variational RFQ creation failed: missing rfq_id")
+            return None
 
-    async def place_bbo_order(self, side: str, quantity: Decimal) -> str:
-        """Place a BBO order on EdgeX."""
-        best_bid, best_ask = await self.fetch_edgex_bbo_prices()
+        quotes = await self._wait_for_rfq_quotes(rfq_id, side)
+        if not quotes:
+            return None
 
-        if side.lower() == 'buy':
-            order_price = best_ask - self.edgex_tick_size
-            order_side = OrderSide.BUY
-        else:
-            order_price = best_bid + self.edgex_tick_size
-            order_side = OrderSide.SELL
+        quote_price, parent_quote_id = quotes
+        return quote_price, rfq_id, parent_quote_id
 
-        self.edgex_client_order_id = str(int(time.time() * 1000))
-        order_result = await self.edgex_client.create_limit_order(
-            contract_id=self.edgex_contract_id,
-            size=str(quantity),
-            price=str(self.round_to_tick(order_price)),
-            side=order_side,
-            post_only=True,
-            client_order_id=self.edgex_client_order_id
+    async def _wait_for_rfq_quotes(self, rfq_id: str, side: TradeSide
+                                   ) -> Optional[Tuple[Decimal, str]]:
+        deadline = time.time() + self.variational_rfq_expires_seconds
+        while time.time() < deadline:
+            resp = await self._run_variational(
+                self.variational_client.get_rfqs_sent,
+                id=rfq_id,
+                price=True,
+            )
+            if resp.result:
+                rfq = resp.result[0]
+                quotes = rfq.get("asks" if side == TradeSide.BUY else "bids", [])
+                if quotes:
+                    if side == TradeSide.BUY:
+                        best = min(quotes, key=lambda q: Decimal(q["quote_price"]))
+                    else:
+                        best = max(quotes, key=lambda q: Decimal(q["quote_price"]))
+                    return Decimal(best["quote_price"]), best["parent_quote_id"]
+            await asyncio.sleep(0.2)
+        return None
+
+    async def accept_variational_quote(self, rfq_id: str, parent_quote_id: str, side: TradeSide):
+        if not self.variational_client:
+            raise Exception("Variational client not initialized")
+
+        await self._run_variational(
+            self.variational_client.accept_quote,
+            rfq_id=rfq_id,
+            parent_quote_id=parent_quote_id,
+            side=side,
         )
 
-        if not order_result or 'data' not in order_result:
-            raise Exception("Failed to place order")
-
-        order_id = order_result['data'].get('orderId')
-        if not order_id:
-            raise Exception("No order ID in response")
-
-        return order_id
-
-    async def place_edgex_post_only_order(self, side: str, quantity: Decimal, stop_flag) -> bool:
-        """Place a post-only order on EdgeX."""
-        if not self.edgex_client:
-            raise Exception("EdgeX client not initialized")
-
-        self.edgex_order_status = None
-        self.logger.info(f"[OPEN] [EdgeX] [{side}] Placing EdgeX POST-ONLY order")
-        order_id = await self.place_bbo_order(side, quantity)
-
-        start_time = time.time()
-        while not stop_flag:
-            if self.edgex_order_status == 'CANCELED':
-                return False
-            elif self.edgex_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
-                await asyncio.sleep(0.5)
-                if time.time() - start_time > 5:
-                    try:
-                        cancel_params = CancelOrderParams(order_id=order_id)
-                        cancel_result = await self.edgex_client.cancel_order(cancel_params)
-                        if not cancel_result or 'data' not in cancel_result:
-                            self.logger.error("❌ Error canceling EdgeX order")
-                    except Exception as e:
-                        self.logger.error(f"❌ Error canceling EdgeX order: {e}")
-            elif self.edgex_order_status == 'FILLED':
-                break
-            else:
-                if self.edgex_order_status is not None:
-                    self.logger.error(f"❌ Unknown EdgeX order status: {self.edgex_order_status}")
-                    return False
-                else:
-                    await asyncio.sleep(0.5)
-        return True
-
-    def handle_edgex_order_update(self, order_data: dict):
-        """Handle EdgeX order update."""
-        side = order_data.get('side', '').lower()
-        filled_size = order_data.get('filled_size')
-        price = order_data.get('price', '0')
-
-        if side == 'buy':
-            lighter_side = 'sell'
-        else:
-            lighter_side = 'buy'
-
-        self.current_lighter_side = lighter_side
-        self.current_lighter_quantity = filled_size
-        self.current_lighter_price = Decimal(price)
-        self.waiting_for_lighter_fill = True
-
-    def update_edgex_order_status(self, status: str):
-        """Update EdgeX order status."""
-        self.edgex_order_status = status
+    async def cancel_variational_rfq(self, rfq_id: str):
+        if not self.variational_client:
+            return
+        await self._run_variational(self.variational_client.cancel_rfq, rfq_id)
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal,
                                          price: Decimal, stop_flag) -> Optional[str]:
-        """Place a market order on Lighter."""
         if not self.lighter_client:
             raise Exception("Lighter client not initialized")
 
@@ -232,17 +197,16 @@ class OrderManager:
 
             return tx_hash
         except Exception as e:
-            self.logger.error(f"❌ Error placing Lighter order: {e}")
+            self.logger.error(f"Error placing Lighter order: {e}")
             return None
 
     async def monitor_lighter_order(self, client_order_index: int, stop_flag):
-        """Monitor Lighter order and wait for fill."""
         start_time = time.time()
         while not self.lighter_order_filled and not stop_flag:
             if time.time() - start_time > 30:
                 self.logger.error(
-                    f"❌ Timeout waiting for Lighter order fill after {time.time() - start_time:.1f}s")
-                self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
+                    f"Timeout waiting for Lighter order fill after {time.time() - start_time:.1f}s")
+                self.logger.warning("Using fallback - marking order as filled to continue trading")
                 self.lighter_order_filled = True
                 self.waiting_for_lighter_fill = False
                 self.order_execution_complete = True
@@ -251,7 +215,6 @@ class OrderManager:
             await asyncio.sleep(0.1)
 
     def handle_lighter_order_filled(self, order_data: dict):
-        """Handle Lighter order fill notification."""
         try:
             order_data["avg_filled_price"] = (
                 Decimal(order_data["filled_quote_amount"]) /
@@ -278,7 +241,3 @@ class OrderManager:
 
         except Exception as e:
             self.logger.error(f"Error handling Lighter order result: {e}")
-
-    def get_edgex_client_order_id(self) -> str:
-        """Get current EdgeX client order ID."""
-        return self.edgex_client_order_id

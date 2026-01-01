@@ -4,7 +4,7 @@ import argparse
 from decimal import Decimal
 import dotenv
 
-from strategy.edgex_arb import EdgexArb
+from strategy.variational_arb import VariationalArb
 
 
 def parse_arguments():
@@ -14,8 +14,8 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter
         )
 
-    parser.add_argument('--exchange', type=str, default='edgex',
-                        help='Exchange to use (edgex)')
+    parser.add_argument('--exchange', type=str, default='variational',
+                        help='Exchange to use (variational)')
     parser.add_argument('--ticker', type=str, default='BTC',
                         help='Ticker symbol (default: BTC)')
     parser.add_argument('--size', type=str, required=True,
@@ -25,15 +25,15 @@ def parse_arguments():
     parser.add_argument('--max-position', type=Decimal, default=Decimal('0'),
                         help='Maximum position to hold (default: 0)')
     parser.add_argument('--long-threshold', type=Decimal, default=Decimal('10'),
-                        help='Long threshold for edgeX (default: 10)')
+                        help='Long threshold for Variational (default: 10)')
     parser.add_argument('--short-threshold', type=Decimal, default=Decimal('10'),
-                        help='Short threshold for edgeX (default: 10)')
+                        help='Short threshold for Variational (default: 10)')
     return parser.parse_args()
 
 
 def validate_exchange(exchange):
     """Validate that the exchange is supported."""
-    supported_exchanges = ['edgex']
+    supported_exchanges = ['variational']
     if exchange.lower() not in supported_exchanges:
         print(f"Error: Unsupported exchange '{exchange}'")
         print(f"Supported exchanges: {', '.join(supported_exchanges)}")
@@ -50,7 +50,7 @@ async def main():
     validate_exchange(args.exchange)
 
     try:
-        bot = EdgexArb(
+        bot = VariationalArb(
             ticker=args.ticker.upper(),
             order_quantity=Decimal(args.size),
             fill_timeout=args.fill_timeout,

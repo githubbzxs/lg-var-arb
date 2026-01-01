@@ -1,12 +1,14 @@
-# edgeX Account Credentials (REQUIRED for API access)
-# Find these in your edgeX account under "API Management"
-EDGEX_ACCOUNT_ID=your_account_id_here
-EDGEX_STARK_PRIVATE_KEY=your_stark_private_key_here
+# Variational API Credentials (REQUIRED)
+VARIATIONAL_API_KEY=your_api_key_here
+VARIATIONAL_API_SECRET=your_api_secret_here
 
+# Variational API Base URL (optional)
+VARIATIONAL_BASE_URL=https://api.variational.io/v1
 
-# EdgeX API Endpoints
-EDGEX_BASE_URL=https://pro.edgex.exchange
-EDGEX_WS_URL=wss://quote.edgex.exchange
+# Variational RFQ Configuration (optional)
+# Comma-separated company IDs (if empty, will auto-detect LP companies)
+VARIATIONAL_TARGET_COMPANY_IDS=
+VARIATIONAL_RFQ_EXPIRES_SECONDS=5
 
 # Lighter Configuration
 API_KEY_PRIVATE_KEY=your_api_key_private_key_here

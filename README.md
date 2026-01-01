@@ -8,10 +8,6 @@
 
 ## 邀请链接 (获得返佣以及福利)
 
-#### edgeX: [https://pro.edgex.exchange/referral/QUANT](https://pro.edgex.exchange/referral/QUANT)
-
-永久享受 VIP 1 费率；额外 10% 手续费返佣；10% 额外奖励积分
-
 #### Backpack: [https://backpack.exchange/join/quant](https://backpack.exchange/join/quant)
 
 使用我的推荐链接获得 35% 手续费返佣
@@ -36,7 +32,7 @@
 
 ## 项目简介
 
-本项目实现了一个跨交易所套利交易机器人，目前主要在 **edgeX** 和 **Lighter** 两个交易所之间进行价差套利。机器人通过在 edgeX 上挂 post-only 限价单（做市单），在 Lighter 上执行市价单来完成套利交易。
+本项目实现了一个跨交易所套利交易机器人，目前主要在 **Variational** 和 **Lighter** 两个交易所之间进行价差套利。机器人通过在 Variational 与 Lighter 上执行 taker 订单来完成套利交易。
 
 ## 功能特性
 
@@ -49,8 +45,8 @@
 
 ## 系统要求
 
-- Python 3.8+
-- edgeX 和 Lighter 交易所账户
+- Python 3.11+
+- Variational 和 Lighter 交易所账户
 - API 密钥和访问权限
 
 ## 安装步骤
@@ -99,13 +95,16 @@ cp env_example.txt .env
 编辑 `.env` 文件，填入你的 API 信息：
 
 ```env
-# edgeX 账户凭证（必需）
-EDGEX_ACCOUNT_ID=your_account_id_here
-EDGEX_STARK_PRIVATE_KEY=your_stark_private_key_here
+# Variational 账户凭证（必需）
+VARIATIONAL_API_KEY=your_api_key_here
+VARIATIONAL_API_SECRET=your_api_secret_here
 
-# EdgeX API 端点
-EDGEX_BASE_URL=https://pro.edgex.exchange
-EDGEX_WS_URL=wss://quote.edgex.exchange
+# Variational API 端点（可选）
+VARIATIONAL_BASE_URL=https://api.variational.io/v1
+
+# Variational RFQ 配置（可选）
+VARIATIONAL_TARGET_COMPANY_IDS=
+VARIATIONAL_RFQ_EXPIRES_SECONDS=5
 
 # Lighter 配置（必需）
 API_KEY_PRIVATE_KEY=your_api_key_private_key_here
@@ -123,12 +122,12 @@ python arbitrage.py --ticker BTC --size 0.002 --max-position 0.1 --long-threshol
 
 ### 命令行参数
 
-- `--exchange`：交易所名称（默认：edgex）
+- `--exchange`：交易所名称（默认：variational）
 - `--ticker`：交易对符号（默认：BTC）
 - `--size`：每笔订单的交易数量（必需）
 - `--max-position`：最大持仓限制（必需）
-- `--long-threshold`：做多套利触发阈值（Lighter 买一价高于 edgeX 卖一价超过多少即做多 edgeX 套利，默认：10）
-- `--short-threshold`：做空套利触发阈值（edgeX 买一价高于 Lighter 卖一价超过多少即做空 edgeX 套利，默认：10）
+- `--long-threshold`：做多套利触发阈值（Lighter 买一价高于 Variational 报价超过多少即做多 Variational 套利，默认：10）
+- `--short-threshold`：做空套利触发阈值（Variational 报价高于 Lighter 卖一价超过多少即做空 Variational 套利，默认：10）
 - `--fill-timeout`：限价单成交超时时间（秒，默认：5）
 
 ### 使用示例
@@ -148,11 +147,10 @@ cross-exchange-arbitrage/
 ├── arbitrage.py              # 主程序入口
 ├── exchanges/                # 交易所接口实现
 │   ├── base.py              # 基础交易所接口
-│   ├── edgex.py             # edgeX 交易所实现
 │   ├── lighter.py           # Lighter 交易所实现
 │   └── lighter_custom_websocket.py  # Lighter WebSocket 管理
 ├── strategy/                 # 交易策略模块
-│   ├── edgex_arb.py         # 主要套利策略
+│   ├── variational_arb.py   # 主要套利策略
 │   ├── order_book_manager.py    # 订单簿管理
 │   ├── order_manager.py     # 订单管理
 │   ├── position_tracker.py  # 仓位跟踪
@@ -165,12 +163,12 @@ cross-exchange-arbitrage/
 
 ## 工作原理
 
-1. **订单簿监控**：通过 WebSocket 实时接收两个交易所的订单簿更新
-2. **价差检测**：计算两个交易所之间的价差
+1. **订单簿监控**：通过 WebSocket 实时接收 Lighter 订单簿更新
+2. **价格获取**：通过 Variational API 获取报价参考价
 3. **套利机会识别**：当价差超过阈值时，识别套利机会
 4. **订单执行**：
-   - 在 edgeX 上挂 post-only 限价单（做市单，赚取手续费）
-   - 在 Lighter 上执行市价单完成对冲
+   - 在 Variational 上执行 taker 订单（RFQ 接受报价）
+   - 在 Lighter 上执行 taker 订单完成对冲
 5. **仓位管理**：实时跟踪仓位，确保不超过最大持仓限制
 6. **风险控制**：监控订单成交状态，超时未成交则取消订单
 
@@ -191,7 +189,7 @@ cross-exchange-arbitrage/
 - `asyncio`：异步编程支持
 - `requests`：HTTP 请求
 - `tenacity`：重试机制
-- `edgex-python-sdk`：edgeX 官方 Python SDK（fork 版本，支持 post-only 限价单）
+- `variational`：Variational 官方 Python SDK
 - `lighter-python`：Lighter 交易所 SDK
 
 ## 许可证

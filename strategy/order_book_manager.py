@@ -1,4 +1,4 @@
-"""Order book management for EdgeX and Lighter exchanges."""
+"""Order book management for Lighter exchange."""
 import asyncio
 import logging
 from decimal import Decimal
@@ -6,17 +6,11 @@ from typing import Tuple, Optional
 
 
 class OrderBookManager:
-    """Manages order book state for both exchanges."""
+    """Manages Lighter order book state."""
 
     def __init__(self, logger: logging.Logger):
         """Initialize order book manager."""
         self.logger = logger
-
-        # EdgeX order book state
-        self.edgex_order_book = {'bids': {}, 'asks': {}}
-        self.edgex_best_bid: Optional[Decimal] = None
-        self.edgex_best_ask: Optional[Decimal] = None
-        self.edgex_order_book_ready = False
 
         # Lighter order book state
         self.lighter_order_book = {"bids": {}, "asks": {}}
@@ -27,45 +21,6 @@ class OrderBookManager:
         self.lighter_order_book_sequence_gap = False
         self.lighter_snapshot_loaded = False
         self.lighter_order_book_lock = asyncio.Lock()
-
-    # EdgeX order book methods
-    def update_edgex_order_book(self, bids: list, asks: list):
-        """Update EdgeX order book with new levels."""
-        # Update bids
-        for bid in bids:
-            price = Decimal(bid['price'])
-            size = Decimal(bid['size'])
-            if size > 0:
-                self.edgex_order_book['bids'][price] = size
-            else:
-                self.edgex_order_book['bids'].pop(price, None)
-
-        # Update asks
-        for ask in asks:
-            price = Decimal(ask['price'])
-            size = Decimal(ask['size'])
-            if size > 0:
-                self.edgex_order_book['asks'][price] = size
-            else:
-                self.edgex_order_book['asks'].pop(price, None)
-
-        # Update best bid and ask
-        if self.edgex_order_book['bids']:
-            self.edgex_best_bid = max(self.edgex_order_book['bids'].keys())
-        if self.edgex_order_book['asks']:
-            self.edgex_best_ask = min(self.edgex_order_book['asks'].keys())
-
-        if not self.edgex_order_book_ready:
-            self.edgex_order_book_ready = True
-            self.logger.info(f"📊 EdgeX order book ready - Best bid: {self.edgex_best_bid}, "
-                             f"Best ask: {self.edgex_best_ask}")
-        else:
-            self.logger.debug(f"📊 Order book updated - Best bid: {self.edgex_best_bid}, "
-                              f"Best ask: {self.edgex_best_ask}")
-
-    def get_edgex_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        """Get EdgeX best bid/ask prices."""
-        return self.edgex_best_bid, self.edgex_best_ask
 
     # Lighter order book methods
     async def reset_lighter_order_book(self):
