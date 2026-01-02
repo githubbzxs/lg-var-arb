@@ -621,6 +621,16 @@ class ParadexArb:
         try:
             is_ask = self._get_bool_value(order_data, "is_ask", "isAsk")
             if is_ask is None:
+                side_hint = str(order_data.get("side", "")).lower()
+                if side_hint in ("sell", "short", "ask"):
+                    is_ask = True
+                elif side_hint in ("buy", "long", "bid"):
+                    is_ask = False
+                else:
+                    fallback_side = getattr(self.order_manager, "lighter_order_side", None)
+                    if fallback_side:
+                        is_ask = str(fallback_side).lower() == "sell"
+            if is_ask is None:
                 is_ask = False
             order_data["is_ask"] = is_ask
 
@@ -637,6 +647,10 @@ class ParadexArb:
                     "initial_base_amount",
                     "initialBaseAmount",
                 )
+            if filled_qty is None or filled_qty <= 0:
+                fallback_qty = getattr(self.order_manager, "lighter_order_size", None)
+                if fallback_qty is not None:
+                    filled_qty = Decimal(str(fallback_qty))
             if filled_qty is None or filled_qty <= 0:
                 self.logger.warning("Lighter 成交数量缺失，无法更新 PnL")
                 return
@@ -658,7 +672,11 @@ class ParadexArb:
                 elif order_price is not None and order_price > 0:
                     avg_filled_price = order_price
                 else:
-                    avg_filled_price = self._last_lighter_mid or Decimal("0")
+                    fallback_price = getattr(self.order_manager, "lighter_order_price", None)
+                    if fallback_price is not None:
+                        avg_filled_price = Decimal(str(fallback_price))
+                    else:
+                        avg_filled_price = self._last_lighter_mid or Decimal("0")
             order_data["avg_filled_price"] = avg_filled_price
 
             if order_data["is_ask"]:

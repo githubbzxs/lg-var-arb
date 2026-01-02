@@ -154,7 +154,8 @@ class WebSocketManagerWrapper:
                                 elif data.get("type") == "update/account_orders":
                                     orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
                                     for order in orders:
-                                        if order.get("status") == "filled" and self.on_lighter_order_filled:
+                                        status = str(order.get("status", "")).lower()
+                                        if status == "filled" and self.on_lighter_order_filled:
                                             self.on_lighter_order_filled(order)
 
                                 elif (data.get("type") == "update/order_book" and
