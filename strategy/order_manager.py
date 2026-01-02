@@ -38,11 +38,13 @@ class OrderManager:
         self.lighter_fill_event = asyncio.Event()
         self.lighter_position_fetcher: Optional[callable] = None
         self._lighter_position_baseline: Optional[Decimal] = None
+        self.log_decimals = int(os.getenv("LOG_DECIMALS", "4"))
+        self.log_decimals = max(0, min(self.log_decimals, 8))
         self.lighter_taker_slippage = Decimal(os.getenv("LIGHTER_TAKER_SLIPPAGE", "0.0002"))
-        self.lighter_use_market_order = os.getenv("LIGHTER_TAKER_USE_MARKET", "0").lower() in (
+        self.lighter_use_market_order = os.getenv("LIGHTER_TAKER_USE_MARKET", "1").lower() in (
             "1", "true", "yes"
         )
-        self.lighter_force_ioc = os.getenv("LIGHTER_TAKER_FORCE_IOC", "0").lower() in (
+        self.lighter_force_ioc = os.getenv("LIGHTER_TAKER_FORCE_IOC", "1").lower() in (
             "1", "true", "yes"
         )
 
@@ -136,6 +138,14 @@ class OrderManager:
                 return str(value)
         return None
 
+    def _format_value(self, value) -> str:
+        if value is None:
+            return "N/A"
+        try:
+            return f"{float(value):.{self.log_decimals}f}"
+        except (TypeError, ValueError):
+            return str(value)
+
     async def fetch_paradex_mid_price(self) -> Decimal:
         if not self.paradex_client or not self.paradex_market:
             raise Exception("Paradex 客户端未初始化")
@@ -193,7 +203,8 @@ class OrderManager:
                 price = Decimal('0')
 
             self.logger.info(
-                f"[{client_order_id}] [Paradex] [{side.upper()}] [开仓]: {quantity}"
+                f"[{client_order_id}] [Paradex] [{side.upper()}] [开仓]: "
+                f"{self._format_value(quantity)}"
             )
             return price
         except Exception as e:
@@ -246,18 +257,23 @@ class OrderManager:
         try:
             client_order_index = int(time.time() * 1000)
             order_type_value = getattr(self.lighter_client, "ORDER_TYPE_LIMIT", None)
+            market_type = getattr(self.lighter_client, "ORDER_TYPE_MARKET", None)
             if self.lighter_use_market_order:
-                market_type = getattr(self.lighter_client, "ORDER_TYPE_MARKET", None)
                 if market_type is not None:
                     order_type_value = market_type
                 else:
                     self.logger.warning("无法使用市价单类型，改用限价单")
 
             time_in_force_value = self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
-            if self.lighter_force_ioc:
+            force_ioc = self.lighter_force_ioc or (
+                market_type is not None and order_type_value == market_type
+            )
+            if force_ioc:
                 ioc_value = getattr(
                     self.lighter_client, "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", None
-                ) or getattr(self.lighter_client, "ORDER_TIME_IN_FORCE_IOC", None)
+                )
+                if ioc_value is None:
+                    ioc_value = getattr(self.lighter_client, "ORDER_TIME_IN_FORCE_IOC", None)
                 if ioc_value is not None:
                     time_in_force_value = ioc_value
                 else:
@@ -282,7 +298,10 @@ class OrderManager:
                 tx_info=tx_info
             )
 
-            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [开仓]: {quantity}")
+            self.logger.info(
+                f"[{client_order_index}] [{order_type}] [Lighter] [开仓]: "
+                f"{self._format_value(quantity)}"
+            )
 
             await self.monitor_lighter_order(client_order_index, stop_flag)
 
@@ -362,7 +381,8 @@ class OrderManager:
 
             self.logger.info(
                 f"[{client_order_index}] [{order_type}] [Lighter] [已成交]: "
-                f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
+                f"{self._format_value(order_data['filled_base_amount'])} @ "
+                f"{self._format_value(order_data['avg_filled_price'])}")
 
             if self.on_order_filled:
                 self.on_order_filled(order_data)

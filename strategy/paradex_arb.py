@@ -82,6 +82,8 @@ from .order_book_manager import OrderBookManager
 from .websocket_manager import WebSocketManagerWrapper
 from .order_manager import OrderManager
 from .position_tracker import PositionTracker
+from .pnl_tracker import PnLTracker
+from .telegram_notifier import TelegramNotifier
 
 
 class ParadexArb:
@@ -109,6 +111,15 @@ class ParadexArb:
         self.spread_max_tiers = int(os.getenv("SPREAD_MAX_TIERS", "3"))
         self.min_spread_std = float(os.getenv("SPREAD_MIN_STD", "0.1"))
         self.min_tier_step = float(os.getenv("SPREAD_MIN_TIER_STEP", "0.5"))
+        self.log_decimals = int(os.getenv("LOG_DECIMALS", "4"))
+        self.log_decimals = max(0, min(self.log_decimals, 8))
+        self.trading_enabled = os.getenv("TRADING_ENABLED", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
         self.paradex_mid_refresh_interval = float(os.getenv("PARADEX_BBO_MIN_INTERVAL", "0.2"))
         self.position_refresh_interval = float(os.getenv("POSITION_REFRESH_INTERVAL", "1.5"))
         self.position_min_request_interval = float(os.getenv("POSITION_MIN_REQUEST_INTERVAL", "0.5"))
@@ -136,14 +147,24 @@ class ParadexArb:
         self._last_paradex_mid = None
         self._last_lighter_bid = None
         self._last_lighter_ask = None
+        self._last_lighter_mid = None
         self._last_long_spread = None
         self._last_short_spread = None
         self._last_long_entry = None
         self._last_short_entry = None
         self._last_long_exit = None
         self._last_short_exit = None
+        self.paradex_pnl = PnLTracker()
+        self.lighter_pnl = PnLTracker()
+        self._pending_trade = None
 
         self._setup_logger()
+
+        self.telegram_notifier = TelegramNotifier(self.logger)
+        self.telegram_status_interval = float(os.getenv("TELEGRAM_STATUS_INTERVAL", "0"))
+        self.telegram_poll_interval = float(os.getenv("TELEGRAM_POLL_INTERVAL", "2"))
+        self._last_telegram_status_ts = 0.0
+        self._last_telegram_poll_ts = 0.0
 
         self.data_logger = DataLogger(exchange="paradex", ticker=ticker, logger=self.logger)
         self.order_book_manager = OrderBookManager(self.logger)
@@ -227,10 +248,28 @@ class ParadexArb:
         if short_spread is not None:
             self.short_spread_stats.add(short_spread)
 
-    def _format_optional(self, value) -> str:
+    def _calc_arb_position(self, paradex_pos: Decimal, lighter_pos: Decimal) -> Decimal:
+        if paradex_pos == 0 or lighter_pos == 0:
+            return paradex_pos + lighter_pos
+        if paradex_pos > 0 and lighter_pos < 0:
+            return min(abs(paradex_pos), abs(lighter_pos))
+        if paradex_pos < 0 and lighter_pos > 0:
+            return -min(abs(paradex_pos), abs(lighter_pos))
+        return paradex_pos + lighter_pos
+
+    def _format_optional(self, value, decimals: Optional[int] = None) -> str:
         if value is None:
             return "无"
-        return str(value)
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, int):
+            return str(value)
+        if decimals is None:
+            decimals = self.log_decimals
+        try:
+            return f"{float(value):.{decimals}f}"
+        except (TypeError, ValueError):
+            return str(value)
 
     def _log_status(self, now: float) -> None:
         if self.status_log_interval <= 0:
@@ -253,8 +292,12 @@ class ParadexArb:
 
         self.logger.info(
             "运行状态: "
-            f"总仓位={net_pos} Paradex仓位={paradex_pos} Lighter仓位={lighter_pos} "
-            f"最大仓位={self.max_position} 等待成交={self.order_manager.waiting_for_lighter_fill} "
+            f"总仓位={self._format_optional(net_pos)} "
+            f"Paradex仓位={self._format_optional(paradex_pos)} "
+            f"Lighter仓位={self._format_optional(lighter_pos)} "
+            f"最大仓位={self._format_optional(self.max_position)} "
+            f"交易开关={'开' if self.trading_enabled else '停'} "
+            f"等待成交={self.order_manager.waiting_for_lighter_fill} "
             f"行情准备好={self.order_book_manager.lighter_order_book_ready} "
             f"行情过期={self.order_book_manager.is_lighter_order_book_stale(self.lighter_book_stale_after)} "
             f"数据缺口={self.order_book_manager.lighter_order_book_sequence_gap} "
@@ -270,6 +313,89 @@ class ParadexArb:
             f"做空退出线={self._format_optional(self._last_short_exit)} "
             f"样本数={self.long_spread_stats.count()}/{self.short_spread_stats.count()}"
         )
+
+    def _build_status_message(self) -> str:
+        if self.position_tracker:
+            paradex_pos = self.position_tracker.get_current_paradex_position()
+            lighter_pos = self.position_tracker.get_current_lighter_position()
+        else:
+            paradex_pos = Decimal("0")
+            lighter_pos = Decimal("0")
+        net_pos = paradex_pos + lighter_pos
+        arb_pos = self._calc_arb_position(paradex_pos, lighter_pos)
+
+        paradex_mid = self.latest_paradex_mid or self._last_paradex_mid
+        lighter_mid = self._last_lighter_mid
+
+        paradex_unreal = self.paradex_pnl.unrealized(paradex_mid)
+        lighter_unreal = self.lighter_pnl.unrealized(lighter_mid)
+        paradex_total = self.paradex_pnl.realized + paradex_unreal
+        lighter_total = self.lighter_pnl.realized + lighter_unreal
+        total_pnl = paradex_total + lighter_total
+
+        return (
+            f"{self.ticker} 状态\n"
+            f"交易开关={'开' if self.trading_enabled else '停'}\n"
+            f"净仓={self._format_optional(net_pos)} 对冲仓={self._format_optional(arb_pos)}\n"
+            f"Paradex 仓位={self._format_optional(paradex_pos)} "
+            f"均价={self._format_optional(self.paradex_pnl.avg_price)} "
+            f"已实现={self._format_optional(self.paradex_pnl.realized)} "
+            f"未实现={self._format_optional(paradex_unreal)}\n"
+            f"Lighter 仓位={self._format_optional(lighter_pos)} "
+            f"均价={self._format_optional(self.lighter_pnl.avg_price)} "
+            f"已实现={self._format_optional(self.lighter_pnl.realized)} "
+            f"未实现={self._format_optional(lighter_unreal)}\n"
+            f"总 PnL={self._format_optional(total_pnl)}\n"
+            f"中间价 Paradex={self._format_optional(paradex_mid)} "
+            f"Lighter={self._format_optional(lighter_mid)}"
+        )
+
+    def _queue_telegram_message(self, message: str) -> None:
+        if not self.telegram_notifier or not self.telegram_notifier.enabled:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.telegram_notifier.send(message))
+        except RuntimeError:
+            self.telegram_notifier.send_sync(message)
+
+    async def _maybe_handle_telegram(self, now: float) -> None:
+        if not self.telegram_notifier or not self.telegram_notifier.enabled:
+            return
+        try:
+            if (
+                self.telegram_poll_interval > 0
+                and now - self._last_telegram_poll_ts >= self.telegram_poll_interval
+            ):
+                self._last_telegram_poll_ts = now
+                commands = await self.telegram_notifier.fetch_commands()
+                for cmd in commands:
+                    command = cmd.strip().lower()
+                    if command in ("/start", "start"):
+                        if not self.trading_enabled:
+                            self.trading_enabled = True
+                            self.logger.info("Telegram: 交易已开启")
+                            await self.telegram_notifier.send("交易已开启")
+                        else:
+                            await self.telegram_notifier.send("交易已处于开启状态")
+                    elif command in ("/stop", "stop"):
+                        if self.trading_enabled:
+                            self.trading_enabled = False
+                            self.logger.info("Telegram: 交易已停止")
+                            await self.telegram_notifier.send("交易已停止（仅允许平仓）")
+                        else:
+                            await self.telegram_notifier.send("交易已处于停止状态")
+                    elif command in ("/status", "status", "/pnl", "pnl"):
+                        await self.telegram_notifier.send(self._build_status_message())
+
+            if (
+                self.telegram_status_interval > 0
+                and now - self._last_telegram_status_ts >= self.telegram_status_interval
+            ):
+                self._last_telegram_status_ts = now
+                await self.telegram_notifier.send(self._build_status_message())
+        except Exception as exc:
+            self.logger.warning(f"Telegram handler error: {exc}")
 
     def _cap_trade_qty(
         self,
@@ -469,10 +595,16 @@ class ParadexArb:
                     self.position_tracker.update_lighter_position(
                         Decimal(order_data["filled_base_amount"]))
 
+            filled_qty = Decimal(order_data["filled_base_amount"])
+            filled_price = order_data["avg_filled_price"]
+            pnl_delta = -filled_qty if order_data["is_ask"] else filled_qty
+            self.lighter_pnl.update(pnl_delta, filled_price)
+
             client_order_index = order_data["client_order_id"]
             self.logger.info(
                 f"[{client_order_index}] [{order_type}] [Lighter] [已成交]: "
-                f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
+                f"{self._format_optional(filled_qty)} @ "
+                f"{self._format_optional(filled_price)}")
 
             self.data_logger.log_trade_to_csv(
                 exchange='lighter',
@@ -481,10 +613,28 @@ class ParadexArb:
                 quantity=str(order_data['filled_base_amount'])
             )
 
+            pending = self._pending_trade
+            if pending:
+                age = time.time() - pending.get("ts", 0)
+                if age < 120:
+                    message = (
+                        f"{self.ticker} {pending.get('action', 'TRADE')}\n"
+                        f"Paradex {pending.get('paradex_side', '')} "
+                        f"{self._format_optional(pending.get('quantity'))} @ "
+                        f"{self._format_optional(pending.get('paradex_price'))}\n"
+                        f"Lighter {order_data['side']} "
+                        f"{self._format_optional(filled_qty)} @ "
+                        f"{self._format_optional(filled_price)}\n"
+                        f"{self._build_status_message()}"
+                    )
+                    self._queue_telegram_message(message)
+                self._pending_trade = None
+
             self.order_manager.mark_lighter_order_filled()
 
         except Exception as e:
             self.logger.error(f"处理 Lighter 订单结果失败: {e}")
+            self._pending_trade = None
 
     def shutdown(self, signum=None, frame=None):
         if self.stop_flag:
@@ -681,6 +831,7 @@ class ParadexArb:
         while not self.stop_flag:
             now = time.monotonic()
             self._log_status(now)
+            await self._maybe_handle_telegram(now)
             if self.max_position <= 0:
                 if not self._max_position_warned:
                     self._max_position_warned = True
@@ -708,6 +859,8 @@ class ParadexArb:
             lighter_bid, lighter_ask = self.order_book_manager.get_lighter_bbo()
             self._last_lighter_bid = lighter_bid
             self._last_lighter_ask = lighter_ask
+            if lighter_bid and lighter_ask:
+                self._last_lighter_mid = (lighter_bid + lighter_ask) / Decimal("2")
             if not lighter_bid or not lighter_ask:
                 await self.order_book_manager.wait_for_lighter_update(timeout=self.loop_sleep)
                 continue
@@ -752,9 +905,12 @@ class ParadexArb:
                     self._last_no_signal_log_ts = now
                     self.logger.info(
                         "未触发交易: "
-                        f"做多差价={long_spread} 做多触发线={long_entry} "
-                        f"做空差价={short_spread} 做空触发线={short_entry} "
-                        f"做多退出线={long_exit} 做空退出线={short_exit} "
+                        f"做多差价={self._format_optional(long_spread)} "
+                        f"做多触发线={self._format_optional(long_entry)} "
+                        f"做空差价={self._format_optional(short_spread)} "
+                        f"做空触发线={self._format_optional(short_entry)} "
+                        f"做多退出线={self._format_optional(long_exit)} "
+                        f"做空退出线={self._format_optional(short_exit)} "
                         f"样本数={self.long_spread_stats.count()}/{self.short_spread_stats.count()}"
                     )
 
@@ -781,6 +937,7 @@ class ParadexArb:
             paradex_pos = self.position_tracker.get_current_paradex_position()
             lighter_pos = self.position_tracker.get_current_lighter_position()
             current_net = paradex_pos + lighter_pos
+            arb_position = self._calc_arb_position(paradex_pos, lighter_pos)
             if abs(current_net) > self.position_imbalance_limit:
                 if now - self._last_imbalance_log_ts > 2:
                     self._last_imbalance_log_ts = now
@@ -798,11 +955,18 @@ class ParadexArb:
                 continue
 
             target_position = self._determine_target_position(
-                current_net, long_spread, short_spread,
+                arb_position, long_spread, short_spread,
                 long_entry, long_exit, short_entry, short_exit,
                 long_std, short_std
-            )       
-            delta = target_position - current_net
+            )
+            if not self.trading_enabled:
+                if arb_position > 0:
+                    target_position = max(Decimal("0"), min(target_position, arb_position))
+                elif arb_position < 0:
+                    target_position = min(Decimal("0"), max(target_position, arb_position))
+                else:
+                    target_position = Decimal("0")
+            delta = target_position - arb_position
             max_trade = self.order_quantity * Decimal(self.spread_max_tiers)
             trade_qty = min(abs(delta), max_trade)
             capped_qty = self._cap_trade_qty(trade_qty, delta, paradex_pos, lighter_pos)
@@ -840,10 +1004,15 @@ class ParadexArb:
             self.logger.error(f"获取仓位失败: {e}")
             return
 
-        if abs(self.position_tracker.get_net_position()) > self.position_imbalance_limit:
-            self.logger.error(
-                f"仓位差过大: {self.position_tracker.get_net_position()}")
+        paradex_pos = self.position_tracker.get_current_paradex_position()
+        lighter_pos = self.position_tracker.get_current_lighter_position()
+        current_net = paradex_pos + lighter_pos
+        arb_before = self._calc_arb_position(paradex_pos, lighter_pos)
+        if abs(current_net) > self.position_imbalance_limit:
+            self.logger.error(f"仓位差过大: {current_net}")
             return
+
+        action = "CLOSE_SHORT" if arb_before < 0 else "OPEN_LONG"
 
         try:
             paradex_price = await self.order_manager.place_paradex_market_order(
@@ -858,6 +1027,14 @@ class ParadexArb:
                 log_price = self.latest_paradex_mid or Decimal('0')
 
             self.position_tracker.update_paradex_position(quantity)
+            self.paradex_pnl.update(quantity, log_price)
+            self._pending_trade = {
+                "action": action,
+                "paradex_side": "BUY",
+                "quantity": quantity,
+                "paradex_price": log_price,
+                "ts": time.time(),
+            }
             self.data_logger.log_trade_to_csv(
                 exchange='paradex',
                 side='LONG',
@@ -877,6 +1054,7 @@ class ParadexArb:
                 return
             self.logger.error(f"执行做多交易失败: {e}")
             self.logger.error(f"完整堆栈: {traceback.format_exc()}")
+            self._pending_trade = None
             return
 
     async def _execute_short_trade(self, quantity: Decimal):
@@ -898,10 +1076,15 @@ class ParadexArb:
             self.logger.error(f"获取仓位失败: {e}")
             return
 
-        if abs(self.position_tracker.get_net_position()) > self.position_imbalance_limit:
-            self.logger.error(
-                f"仓位差过大: {self.position_tracker.get_net_position()}")
+        paradex_pos = self.position_tracker.get_current_paradex_position()
+        lighter_pos = self.position_tracker.get_current_lighter_position()
+        current_net = paradex_pos + lighter_pos
+        arb_before = self._calc_arb_position(paradex_pos, lighter_pos)
+        if abs(current_net) > self.position_imbalance_limit:
+            self.logger.error(f"仓位差过大: {current_net}")
             return
+
+        action = "CLOSE_LONG" if arb_before > 0 else "OPEN_SHORT"
 
         try:
             paradex_price = await self.order_manager.place_paradex_market_order(
@@ -916,6 +1099,14 @@ class ParadexArb:
                 log_price = self.latest_paradex_mid or Decimal('0')
 
             self.position_tracker.update_paradex_position(-quantity)
+            self.paradex_pnl.update(-quantity, log_price)
+            self._pending_trade = {
+                "action": action,
+                "paradex_side": "SELL",
+                "quantity": quantity,
+                "paradex_price": log_price,
+                "ts": time.time(),
+            }
             self.data_logger.log_trade_to_csv(
                 exchange='paradex',
                 side='SHORT',
@@ -935,6 +1126,7 @@ class ParadexArb:
                 return
             self.logger.error(f"执行做空交易失败: {e}")
             self.logger.error(f"完整堆栈: {traceback.format_exc()}")
+            self._pending_trade = None
             return
 
     async def run(self):
